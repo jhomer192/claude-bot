@@ -1,0 +1,31 @@
+[Unit]
+Description=Claude Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/opt/claude-bot
+EnvironmentFile=/etc/claude-bot.env
+ExecStart=/usr/bin/node --enable-source-maps dist/index.js
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/claude /var/lib/claude-bot
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# RestrictNamespaces=true  # disabled: blocks the Claude CLI from spawning its subprocess (EACCES)
+RestrictRealtime=true
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

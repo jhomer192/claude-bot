@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+*.log
+state.db
+state.db-journal
+state.db-shm
+state.db-wal
+workspace/
+.claude/
