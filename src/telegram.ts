@@ -209,7 +209,8 @@ const HELP_TEXT = [
   "Commands:",
   "/new        — start a fresh session (forgets prior context)",
   "/repo owner/name  — set the repo I'll work in",
-  "/stop       — interrupt the current turn",
+  "/stop       — interrupt the current turn (queued messages keep going)",
+  "/drain      — cancel everything still in the queue",
   "/cost       — show today's spend in this chat",
   "/help       — show this message",
   "",
@@ -221,13 +222,13 @@ interface PendingTurn {
   userMessageId: number;
   text: string;
   placeholderId: number;
-  timer: NodeJS.Timeout;
 }
 
 export class TelegramBridge {
   private bot: Bot;
   private active = new Map<string, Query>();
-  private pending = new Map<string, PendingTurn>();
+  private queue = new Map<string, PendingTurn[]>();
+  private readyTimer = new Map<string, NodeJS.Timeout>();
 
   constructor(private readonly sessions: SessionStore) {
     this.bot = new Bot(config.telegramBotToken);
@@ -244,8 +245,9 @@ export class TelegramBridge {
   }
 
   async stop(): Promise<void> {
-    for (const p of this.pending.values()) clearTimeout(p.timer);
-    this.pending.clear();
+    for (const t of this.readyTimer.values()) clearTimeout(t);
+    this.readyTimer.clear();
+    this.queue.clear();
     for (const q of this.active.values()) {
       try { await q.interrupt(); } catch { /* ignore */ }
     }
@@ -275,22 +277,40 @@ export class TelegramBridge {
 
     this.bot.command("stop", async (ctx) => {
       const chatId = String(ctx.chat.id);
-      const pending = this.pending.get(chatId);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pending.delete(chatId);
-        try {
-          await this.bot.api.editMessageText(ctx.chat.id, pending.placeholderId, "⏹ cancelled");
-        } catch { /* ignore */ }
-        return;
-      }
       const q = this.active.get(chatId);
       if (q) {
+        // The next queued message (if any) will auto-start via advanceQueue.
         await q.interrupt();
         await ctx.reply("⏹ stopped");
-      } else {
-        await ctx.reply("nothing running");
+        return;
       }
+      // Nothing running — cancel the front of the queue if it's about to fire.
+      const front = this.dequeueFront(chatId);
+      if (front) {
+        try {
+          await this.bot.api.editMessageText(ctx.chat.id, front.placeholderId, "⏹ cancelled");
+        } catch { /* ignore */ }
+        this.advanceQueue(chatId);
+        return;
+      }
+      await ctx.reply("nothing running");
+    });
+
+    this.bot.command("drain", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const items = this.queue.get(chatId) ?? [];
+      const timer = this.readyTimer.get(chatId);
+      if (timer) {
+        clearTimeout(timer);
+        this.readyTimer.delete(chatId);
+      }
+      this.queue.delete(chatId);
+      for (const item of items) {
+        try {
+          await this.bot.api.editMessageText(ctx.chat.id, item.placeholderId, "⏹ cancelled");
+        } catch { /* ignore */ }
+      }
+      await ctx.reply(`⏹ drained ${items.length} queued message${items.length === 1 ? "" : "s"}`);
     });
 
     this.bot.command("cost", async (ctx) => {
@@ -349,69 +369,110 @@ export class TelegramBridge {
       return;
     }
 
-    if (this.active.has(chatId)) {
-      await ctx.reply("already working — send /stop first");
-      return;
-    }
+    const items = this.queue.get(chatId) ?? [];
+    const positionBehind = items.length + (this.active.has(chatId) ? 1 : 0);
+    const label = positionBehind === 0
+      ? `⏳ queued (${EDIT_WINDOW_MS / 1000}s to edit)`
+      : `⏳ queued (#${positionBehind + 1} in line — edit anytime before it starts)`;
+    const placeholder = await ctx.reply(label);
 
-    const existing = this.pending.get(chatId);
-    if (existing) {
-      // Second message while a prior one is still in its edit window. Fire the
-      // first immediately and reject this one — the user can /stop and resend.
-      clearTimeout(existing.timer);
-      this.pending.delete(chatId);
-      void this.runTurn(existing.chatId, existing.text, existing.placeholderId);
-      await ctx.reply("starting the previous message — /stop and resend to replace");
-      return;
-    }
-
-    const placeholder = await ctx.reply(`⏳ queued (${EDIT_WINDOW_MS / 1000}s to edit)`);
-    const timer = setTimeout(() => {
-      const p = this.pending.get(chatId);
-      if (!p) return;
-      this.pending.delete(chatId);
-      void this.runTurn(p.chatId, p.text, p.placeholderId);
-    }, EDIT_WINDOW_MS);
-
-    this.pending.set(chatId, {
+    items.push({
       chatId: chatIdNum,
       userMessageId,
       text,
       placeholderId: placeholder.message_id,
-      timer,
     });
+    this.queue.set(chatId, items);
+
+    this.maybeArmReady(chatId);
   }
 
   private async handleEdit(ctx: Context): Promise<void> {
     const chatIdNum = ctx.chat!.id;
     const chatId = String(chatIdNum);
     const edited = ctx.editedMessage!;
-    const pending = this.pending.get(chatId);
-    if (!pending || pending.userMessageId !== edited.message_id) {
+    const items = this.queue.get(chatId) ?? [];
+    const idx = items.findIndex((p) => p.userMessageId === edited.message_id);
+    if (idx < 0) {
+      // Either already processing or never queued.
       if (this.active.has(chatId)) {
         await ctx.reply("can't edit mid-turn — /stop first");
       }
       return;
     }
-    pending.text = edited.text ?? pending.text;
-    clearTimeout(pending.timer);
-    pending.timer = setTimeout(() => {
-      const p = this.pending.get(chatId);
-      if (!p) return;
-      this.pending.delete(chatId);
-      void this.runTurn(p.chatId, p.text, p.placeholderId);
-    }, EDIT_WINDOW_MS);
+    const item = items[idx]!;
+    item.text = edited.text ?? item.text;
+    const isFront = idx === 0 && !this.active.has(chatId);
+    if (isFront) {
+      // Reset debounce so the user gets a fresh window after the edit lands.
+      const timer = this.readyTimer.get(chatId);
+      if (timer) clearTimeout(timer);
+      this.readyTimer.delete(chatId);
+      this.maybeArmReady(chatId);
+    }
+    const label = isFront
+      ? `⏳ queued — edit received (${EDIT_WINDOW_MS / 1000}s to edit again)`
+      : `⏳ queued — edit received (#${idx + 1 + (this.active.has(chatId) ? 1 : 0)} in line)`;
     try {
-      await this.bot.api.editMessageText(
-        chatIdNum,
-        pending.placeholderId,
-        `⏳ queued — edit received (${EDIT_WINDOW_MS / 1000}s to edit again)`,
-      );
+      await this.bot.api.editMessageText(chatIdNum, item.placeholderId, label);
     } catch { /* ignore */ }
+  }
+
+  private maybeArmReady(chatId: string): void {
+    if (this.active.has(chatId)) return;
+    if (this.readyTimer.has(chatId)) return;
+    const items = this.queue.get(chatId);
+    if (!items || items.length === 0) return;
+    const timer = setTimeout(() => {
+      this.readyTimer.delete(chatId);
+      const front = this.dequeueFront(chatId);
+      if (!front) return;
+      void this.runTurn(front.chatId, front.text, front.placeholderId);
+    }, EDIT_WINDOW_MS);
+    this.readyTimer.set(chatId, timer);
+  }
+
+  private dequeueFront(chatId: string): PendingTurn | undefined {
+    const timer = this.readyTimer.get(chatId);
+    if (timer) {
+      clearTimeout(timer);
+      this.readyTimer.delete(chatId);
+    }
+    const items = this.queue.get(chatId);
+    if (!items || items.length === 0) return undefined;
+    const front = items.shift();
+    if (items.length === 0) this.queue.delete(chatId);
+    return front;
+  }
+
+  private advanceQueue(chatId: string): void {
+    const items = this.queue.get(chatId);
+    if (!items || items.length === 0) return;
+    // New front — update its placeholder to show it's about to fire, then arm.
+    const front = items[0]!;
+    void this.bot.api
+      .editMessageText(front.chatId, front.placeholderId, `⏳ queued (${EDIT_WINDOW_MS / 1000}s to edit)`)
+      .catch(() => {});
+    this.maybeArmReady(chatId);
   }
 
   private async runTurn(chatIdNum: number, prompt: string, placeholderId: number): Promise<void> {
     const chatId = String(chatIdNum);
+
+    // Re-check the cost cap: earlier items in the queue may have pushed us over
+    // since this one was accepted.
+    const dailyCost = this.sessions.getDailyCost(chatId);
+    if (dailyCost >= config.dailyCostCapUsd) {
+      try {
+        await this.bot.api.editMessageText(
+          chatIdNum,
+          placeholderId,
+          `⛔ daily cost cap reached ($${dailyCost.toFixed(2)} / $${config.dailyCostCapUsd})`,
+        );
+      } catch { /* ignore */ }
+      this.advanceQueue(chatId);
+      return;
+    }
 
     const sessionId = this.sessions.getSessionId(chatId);
     const repo = this.sessions.getRepo(chatId);
@@ -428,6 +489,7 @@ export class TelegramBridge {
             `✗ could not prepare workspace: ${truncate(String(err), 500)}`,
           );
         } catch { /* ignore */ }
+        this.advanceQueue(chatId);
         return;
       }
     }
@@ -497,6 +559,7 @@ export class TelegramBridge {
       } catch { /* ignore */ }
     } finally {
       this.active.delete(chatId);
+      this.advanceQueue(chatId);
     }
   }
 }
