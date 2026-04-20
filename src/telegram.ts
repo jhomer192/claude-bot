@@ -7,6 +7,7 @@ import { ensureCloned, isValidSlug, repoPath } from "./workspace.js";
 
 const MAX_MSG = 4096;
 const SOFT_CAP = 3800;
+const EDIT_WINDOW_MS = 3000;
 
 // Loose block type — the SDK's real types are a wide discriminated union.
 // We narrow at runtime via block.type, so this permissive shape is fine.
@@ -14,8 +15,24 @@ const SOFT_CAP = 3800;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyBlock = { type: string } & Record<string, any>;
 
+// n is the maximum length of the returned string, including the ellipsis.
 function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n) + "…" : s;
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+// Split text into pieces no longer than cap, preferring to break on newlines.
+function splitForTelegram(text: string, cap: number = MAX_MSG): string[] {
+  if (text.length <= cap) return [text];
+  const out: string[] = [];
+  let rest = text;
+  while (rest.length > cap) {
+    let cut = rest.lastIndexOf("\n", cap);
+    if (cut <= 0) cut = cap;
+    out.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, "");
+  }
+  if (rest.length > 0) out.push(rest);
+  return out;
 }
 
 function cleanToolName(name: string): string {
@@ -112,22 +129,36 @@ class StreamingRenderer {
   async append(text: string): Promise<void> {
     if (!text) return;
     const combined = this.buffer + text;
-    if (combined.length > SOFT_CAP) {
-      // Freeze current message if it has content, start a new one
+    if (combined.length <= SOFT_CAP) {
+      this.buffer = combined;
+      this.scheduleEdit();
+      return;
+    }
+    // Freeze current message (if it has content), then start one or more new
+    // messages to hold the overflow. A single append may be larger than one
+    // Telegram message can hold, so we split on newlines where possible.
+    await this.flushEdit();
+    const hadContent = this.buffer.trim().length > 0;
+    const pieces = splitForTelegram(text, SOFT_CAP);
+    if (!hadContent) {
+      // Current message is empty (just the placeholder). Edit it with the first
+      // piece instead of sending a new one.
+      this.buffer = pieces[0]!;
       await this.flushEdit();
-      if (this.buffer.trim().length > 0) {
-        const next = await this.bot.api.sendMessage(this.chatId, truncate(text, MAX_MSG));
+      for (const piece of pieces.slice(1)) {
+        const next = await this.bot.api.sendMessage(this.chatId, piece);
         this.activeMessageId = next.message_id;
-        this.buffer = text;
-        this.lastSent = text;
-      } else {
-        this.buffer = text;
-        this.scheduleEdit();
+        this.buffer = piece;
+        this.lastSent = piece;
       }
       return;
     }
-    this.buffer = combined;
-    this.scheduleEdit();
+    for (const piece of pieces) {
+      const next = await this.bot.api.sendMessage(this.chatId, piece);
+      this.activeMessageId = next.message_id;
+      this.buffer = piece;
+      this.lastSent = piece;
+    }
   }
 
   async finalize(footer?: string): Promise<void> {
@@ -185,9 +216,18 @@ const HELP_TEXT = [
   "Otherwise, just send a message and I'll work on it.",
 ].join("\n");
 
+interface PendingTurn {
+  chatId: number;
+  userMessageId: number;
+  text: string;
+  placeholderId: number;
+  timer: NodeJS.Timeout;
+}
+
 export class TelegramBridge {
   private bot: Bot;
   private active = new Map<string, Query>();
+  private pending = new Map<string, PendingTurn>();
 
   constructor(private readonly sessions: SessionStore) {
     this.bot = new Bot(config.telegramBotToken);
@@ -198,11 +238,14 @@ export class TelegramBridge {
     console.log("Starting Telegram bot (long-polling)…");
     // start() blocks; don't await — it runs until the bot stops
     void this.bot.start({
+      allowed_updates: ["message", "edited_message"],
       onStart: (info) => console.log(`Logged in as @${info.username}`),
     });
   }
 
   async stop(): Promise<void> {
+    for (const p of this.pending.values()) clearTimeout(p.timer);
+    this.pending.clear();
     for (const q of this.active.values()) {
       try { await q.interrupt(); } catch { /* ignore */ }
     }
@@ -232,6 +275,15 @@ export class TelegramBridge {
 
     this.bot.command("stop", async (ctx) => {
       const chatId = String(ctx.chat.id);
+      const pending = this.pending.get(chatId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(chatId);
+        try {
+          await this.bot.api.editMessageText(ctx.chat.id, pending.placeholderId, "⏹ cancelled");
+        } catch { /* ignore */ }
+        return;
+      }
       const q = this.active.get(chatId);
       if (q) {
         await q.interrupt();
@@ -270,7 +322,11 @@ export class TelegramBridge {
 
     this.bot.on("message:text", async (ctx) => {
       if (ctx.message.text.startsWith("/")) return; // command handlers will have caught it
-      await this.runTurn(ctx, ctx.message.text);
+      await this.enqueueTurn(ctx, ctx.message.message_id, ctx.message.text);
+    });
+
+    this.bot.on("edited_message:text", async (ctx) => {
+      await this.handleEdit(ctx);
     });
 
     this.bot.catch((err) => {
@@ -281,9 +337,9 @@ export class TelegramBridge {
     });
   }
 
-  private async runTurn(ctx: Context, prompt: string): Promise<void> {
-    const chatId = String(ctx.chat!.id);
+  private async enqueueTurn(ctx: Context, userMessageId: number, text: string): Promise<void> {
     const chatIdNum = ctx.chat!.id;
+    const chatId = String(chatIdNum);
 
     const dailyCost = this.sessions.getDailyCost(chatId);
     if (dailyCost >= config.dailyCostCapUsd) {
@@ -298,6 +354,65 @@ export class TelegramBridge {
       return;
     }
 
+    const existing = this.pending.get(chatId);
+    if (existing) {
+      // Second message while a prior one is still in its edit window. Fire the
+      // first immediately and reject this one — the user can /stop and resend.
+      clearTimeout(existing.timer);
+      this.pending.delete(chatId);
+      void this.runTurn(existing.chatId, existing.text, existing.placeholderId);
+      await ctx.reply("starting the previous message — /stop and resend to replace");
+      return;
+    }
+
+    const placeholder = await ctx.reply(`⏳ queued (${EDIT_WINDOW_MS / 1000}s to edit)`);
+    const timer = setTimeout(() => {
+      const p = this.pending.get(chatId);
+      if (!p) return;
+      this.pending.delete(chatId);
+      void this.runTurn(p.chatId, p.text, p.placeholderId);
+    }, EDIT_WINDOW_MS);
+
+    this.pending.set(chatId, {
+      chatId: chatIdNum,
+      userMessageId,
+      text,
+      placeholderId: placeholder.message_id,
+      timer,
+    });
+  }
+
+  private async handleEdit(ctx: Context): Promise<void> {
+    const chatIdNum = ctx.chat!.id;
+    const chatId = String(chatIdNum);
+    const edited = ctx.editedMessage!;
+    const pending = this.pending.get(chatId);
+    if (!pending || pending.userMessageId !== edited.message_id) {
+      if (this.active.has(chatId)) {
+        await ctx.reply("can't edit mid-turn — /stop first");
+      }
+      return;
+    }
+    pending.text = edited.text ?? pending.text;
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => {
+      const p = this.pending.get(chatId);
+      if (!p) return;
+      this.pending.delete(chatId);
+      void this.runTurn(p.chatId, p.text, p.placeholderId);
+    }, EDIT_WINDOW_MS);
+    try {
+      await this.bot.api.editMessageText(
+        chatIdNum,
+        pending.placeholderId,
+        `⏳ queued — edit received (${EDIT_WINDOW_MS / 1000}s to edit again)`,
+      );
+    } catch { /* ignore */ }
+  }
+
+  private async runTurn(chatIdNum: number, prompt: string, placeholderId: number): Promise<void> {
+    const chatId = String(chatIdNum);
+
     const sessionId = this.sessions.getSessionId(chatId);
     const repo = this.sessions.getRepo(chatId);
     const cwd = repo ? repoPath(config.workspaceDir, repo) : config.workspaceDir;
@@ -306,13 +421,21 @@ export class TelegramBridge {
       try {
         await ensureCloned(config.workspaceDir, repo, config.githubToken);
       } catch (err) {
-        await ctx.reply(`✗ could not prepare workspace: ${truncate(String(err), 500)}`);
+        try {
+          await this.bot.api.editMessageText(
+            chatIdNum,
+            placeholderId,
+            `✗ could not prepare workspace: ${truncate(String(err), 500)}`,
+          );
+        } catch { /* ignore */ }
         return;
       }
     }
 
-    const placeholder = await ctx.reply("⏳ working…");
-    const renderer = new StreamingRenderer(this.bot, chatIdNum, placeholder.message_id);
+    try {
+      await this.bot.api.editMessageText(chatIdNum, placeholderId, "⏳ working…");
+    } catch { /* ignore */ }
+    const renderer = new StreamingRenderer(this.bot, chatIdNum, placeholderId);
 
     const q = startTurn({
       prompt,
@@ -370,7 +493,7 @@ export class TelegramBridge {
     } catch (err) {
       console.error("Turn failed:", err);
       try {
-        await ctx.reply(`✗ turn failed: ${truncate(String(err), 500)}`);
+        await this.bot.api.sendMessage(chatIdNum, `✗ turn failed: ${truncate(String(err), 500)}`);
       } catch { /* ignore */ }
     } finally {
       this.active.delete(chatId);
