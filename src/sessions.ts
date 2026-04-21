@@ -18,11 +18,18 @@ export class SessionStore {
         chat_id           TEXT PRIMARY KEY,
         session_id        TEXT,
         repo              TEXT,
+        model             TEXT,
         daily_cost_usd    REAL NOT NULL DEFAULT 0,
         daily_cost_date   TEXT NOT NULL DEFAULT '',
         last_turn_at      INTEGER NOT NULL DEFAULT 0
       );
     `);
+    // Migrate older DBs that predate the model column.
+    try {
+      this.db.exec(`ALTER TABLE chats ADD COLUMN model TEXT`);
+    } catch {
+      // column already exists
+    }
   }
 
   getSessionId(chatId: string): string | null {
@@ -68,6 +75,24 @@ export class SessionStore {
          ON CONFLICT(chat_id) DO UPDATE SET repo = excluded.repo`,
       )
       .run(chatId, repo);
+  }
+
+  getModel(chatId: string): string | null {
+    const row = this.db
+      .prepare<[string], { model: string | null }>(
+        `SELECT model FROM chats WHERE chat_id = ?`,
+      )
+      .get(chatId);
+    return row?.model ?? null;
+  }
+
+  setModel(chatId: string, model: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO chats (chat_id, model) VALUES (?, ?)
+         ON CONFLICT(chat_id) DO UPDATE SET model = excluded.model`,
+      )
+      .run(chatId, model);
   }
 
   getDailyCost(chatId: string): number {

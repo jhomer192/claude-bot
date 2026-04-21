@@ -38,6 +38,7 @@ export const config = {
   stateDbPath: optional("STATE_DB_PATH", "/var/lib/claude-bot/state.db"),
   dailyCostCapUsd: Number(optional("DAILY_COST_CAP_USD", "5")),
   mcpConfigPath: process.env.MCP_CONFIG_PATH?.trim() || null,
+  defaultModel: optional("DEFAULT_MODEL", "claude-opus-4-7"),
 } as const;
 
 if (!Number.isFinite(config.dailyCostCapUsd) || config.dailyCostCapUsd < 0) {

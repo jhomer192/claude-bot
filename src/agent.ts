@@ -5,13 +5,14 @@ export interface TurnInput {
   prompt: string;
   sessionId: string | null;
   cwd: string;
+  model: string;
   mcpServers?: Options["mcpServers"];
 }
 
-export function startTurn({ prompt, sessionId, cwd, mcpServers }: TurnInput): Query {
+export function startTurn({ prompt, sessionId, cwd, model, mcpServers }: TurnInput): Query {
   const options: Options = {
     cwd,
-    model: "claude-opus-4-7",
+    model,
     permissionMode: "bypassPermissions",
     systemPrompt: { type: "preset", preset: "claude_code" },
     settingSources: ["project"],

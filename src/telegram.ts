@@ -9,6 +9,27 @@ const MAX_MSG = 4096;
 const SOFT_CAP = 3800;
 const EDIT_WINDOW_MS = 3000;
 
+// Short aliases → full model IDs. Raw `claude-*` IDs are also accepted.
+const MODEL_ALIASES: Record<string, string> = {
+  "opus": "claude-opus-4-7",
+  "opus-4.7": "claude-opus-4-7",
+  "4.7": "claude-opus-4-7",
+  "opus-4.6": "claude-opus-4-6",
+  "4.6": "claude-opus-4-6",
+  "sonnet": "claude-sonnet-4-6",
+  "sonnet-4.6": "claude-sonnet-4-6",
+  "haiku": "claude-haiku-4-5-20251001",
+  "haiku-4.5": "claude-haiku-4-5-20251001",
+};
+
+function resolveModel(input: string): string | null {
+  const key = input.trim().toLowerCase();
+  if (!key) return null;
+  if (MODEL_ALIASES[key]) return MODEL_ALIASES[key];
+  if (/^claude-[a-z0-9-]+$/.test(key)) return key;
+  return null;
+}
+
 // Loose block type — the SDK's real types are a wide discriminated union.
 // We narrow at runtime via block.type, so this permissive shape is fine.
 // deno-lint-ignore no-explicit-any
@@ -209,6 +230,7 @@ const HELP_TEXT = [
   "Commands:",
   "/new        — start a fresh session (forgets prior context)",
   "/repo owner/name  — set the repo I'll work in",
+  "/model <name>  — set the model (opus, sonnet, haiku, 4.6, …); no arg to show current",
   "/stop       — interrupt the current turn (queued messages keep going)",
   "/drain      — cancel everything still in the queue",
   "/cost       — show today's spend in this chat",
@@ -317,6 +339,28 @@ export class TelegramBridge {
       const chatId = String(ctx.chat.id);
       const spent = this.sessions.getDailyCost(chatId);
       await ctx.reply(`today: $${spent.toFixed(4)} / $${config.dailyCostCapUsd.toFixed(2)}`);
+    });
+
+    this.bot.command("model", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const arg = ctx.match.trim();
+      if (!arg) {
+        const current = this.sessions.getModel(chatId) ?? config.defaultModel;
+        await ctx.reply(`model: ${current}`);
+        return;
+      }
+      if (arg === "default" || arg === "reset") {
+        this.sessions.setModel(chatId, null);
+        await ctx.reply(`✓ model reset to default (${config.defaultModel})`);
+        return;
+      }
+      const resolved = resolveModel(arg);
+      if (!resolved) {
+        await ctx.reply(`unknown model "${arg}" — try: opus, sonnet, haiku, 4.6, or a full claude-* id`);
+        return;
+      }
+      this.sessions.setModel(chatId, resolved);
+      await ctx.reply(`✓ model set to ${resolved}`);
     });
 
     this.bot.command("repo", async (ctx) => {
@@ -499,10 +543,13 @@ export class TelegramBridge {
     } catch { /* ignore */ }
     const renderer = new StreamingRenderer(this.bot, chatIdNum, placeholderId);
 
+    const model = this.sessions.getModel(chatId) ?? config.defaultModel;
+
     const q = startTurn({
       prompt,
       sessionId,
       cwd,
+      model,
       mcpServers: loadMcpServers(config.mcpConfigPath),
     });
     this.active.set(chatId, q);
