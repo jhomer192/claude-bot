@@ -18,8 +18,14 @@ RestartSec=5s
 
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/home/claude /var/lib/claude-bot
+# ProtectHome=true shadows /home with an inaccessible tmpfs, and
+# ReadWritePaths= does not punch through it (it only toggles writability on
+# already-visible paths). The child CLI's cwd lives under /home/claude, so
+# posix_spawn's chdir() fails → EACCES. Use tmpfs + BindPaths to bind the
+# real /home/claude into the service's mount namespace.
+ProtectHome=tmpfs
+BindPaths=/home/claude
+ReadWritePaths=/var/lib/claude-bot
 PrivateTmp=true
 RestrictSUIDSGID=true
 LockPersonality=true
