@@ -261,6 +261,7 @@ const HELP_TEXT = [
   "/repo owner/name  — set the repo I'll work in",
   "/model <name>  — set the model (opus, sonnet, haiku, 4.6, …); no arg to show current",
   "/stop       — interrupt the current turn (queued messages keep going)",
+  "/queue      — show the active turn and everything queued",
   "/drain      — cancel everything still in the queue",
   "/restart    — hard-restart the bot process (use if the bot is wedged)",
   "/cost       — show today's spend in this chat",
@@ -282,6 +283,7 @@ export class TelegramBridge {
   private bot: Bot;
   private active = new Map<string, Query>();
   private activeStartedAt = new Map<string, number>();
+  private activePrompt = new Map<string, string>();
   private queue = new Map<string, PendingTurn[]>();
   private readyTimer = new Map<string, NodeJS.Timeout>();
   private watchdog: NodeJS.Timeout | null = null;
@@ -315,6 +317,7 @@ export class TelegramBridge {
     );
     this.active.clear();
     this.activeStartedAt.clear();
+    this.activePrompt.clear();
     await this.bot.stop();
   }
 
@@ -378,6 +381,8 @@ export class TelegramBridge {
           // chat isn't stuck on active.has() forever. The zombie SDK
           // subprocess will leak until the service restarts.
           this.active.delete(chatId);
+          this.activeStartedAt.delete(chatId);
+          this.activePrompt.delete(chatId);
           this.advanceQueue(chatId);
           await ctx.reply("⏹ force-stopped — SDK unresponsive, state cleared");
         }
@@ -417,6 +422,27 @@ export class TelegramBridge {
         } catch { /* ignore */ }
       }
       await ctx.reply(`⏹ drained ${items.length} queued message${items.length === 1 ? "" : "s"}`);
+    });
+
+    this.bot.command("queue", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const now = Date.now();
+      const lines: string[] = [];
+
+      const startedAt = this.activeStartedAt.get(chatId);
+      if (startedAt !== undefined) {
+        const elapsedS = Math.floor((now - startedAt) / 1000);
+        const prompt = this.activePrompt.get(chatId) ?? "";
+        lines.push(`▶ active (${elapsedS}s): ${truncate(prompt, 100)}`);
+      }
+
+      const items = this.queue.get(chatId) ?? [];
+      items.forEach((item, i) => {
+        const ageS = Math.floor((now - item.enqueuedAt) / 1000);
+        lines.push(`#${i + 1} (${ageS}s ago): ${truncate(item.text, 100)}`);
+      });
+
+      await ctx.reply(lines.length === 0 ? "queue is empty" : lines.join("\n"));
     });
 
     this.bot.command("cost", async (ctx) => {
@@ -657,6 +683,7 @@ export class TelegramBridge {
     const turnStartedAt = Date.now();
     this.active.set(chatId, q);
     this.activeStartedAt.set(chatId, turnStartedAt);
+    this.activePrompt.set(chatId, prompt);
 
     try {
       // Drive iteration manually so we can race each step against an idle
@@ -754,6 +781,7 @@ export class TelegramBridge {
     } finally {
       this.active.delete(chatId);
       this.activeStartedAt.delete(chatId);
+      this.activePrompt.delete(chatId);
       this.advanceQueue(chatId);
     }
   }
