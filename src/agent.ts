@@ -8,10 +8,14 @@ import {
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const require_ = createRequire(import.meta.url);
-const CLAUDE_CODE_CLI_PATH = require_.resolve(
-  "@anthropic-ai/claude-agent-sdk/cli.js",
+// SDK's package.json exports map doesn't expose cli.js, so resolve the main
+// entry (sdk.mjs) and take its sibling.
+const CLAUDE_CODE_CLI_PATH = join(
+  dirname(require_.resolve("@anthropic-ai/claude-agent-sdk")),
+  "cli.js",
 );
 
 export interface TurnInput {
