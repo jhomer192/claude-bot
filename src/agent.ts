@@ -17,6 +17,9 @@ export function startTurn({ prompt, sessionId, cwd, model, mcpServers }: TurnInp
     systemPrompt: { type: "preset", preset: "claude_code" },
     settingSources: ["project"],
     maxTurns: 10000,
+    // Every Telegram message is already the answer — a structured follow-up
+    // tool leaves an orphan tool_use that poisons the session on resume.
+    disallowedTools: ["AskUserQuestion"],
     ...(sessionId ? { resume: sessionId } : {}),
     ...(mcpServers ? { mcpServers } : {}),
   };

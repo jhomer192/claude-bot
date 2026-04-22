@@ -8,6 +8,31 @@ import { ensureCloned, isValidSlug, repoPath } from "./workspace.js";
 const MAX_MSG = 4096;
 const SOFT_CAP = 3800;
 const EDIT_WINDOW_MS = 3000;
+// If the SDK emits nothing for this long, the turn is wedged (e.g. a Bash
+// call blocked on a never-exiting process). Abort and unblock the chat.
+const TURN_IDLE_TIMEOUT_MS = 8 * 60 * 1000;
+// q.interrupt() can hang forever when the SDK subprocess is wedged.
+// Cap it so /stop always returns to the user.
+const INTERRUPT_TIMEOUT_MS = 2000;
+// Last-ditch safety net: if any turn has been active or any queue item has
+// been sitting for longer than this, exit the process so systemd restarts
+// the service and clears all in-memory state.
+const STALE_STATE_LIMIT_MS = 60 * 60 * 1000;
+const WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
+
+const IDLE_TIMEOUT_MARKER = "__claude_bot_idle_timeout__";
+
+// Returns true if interrupt() completed (success or SDK-side error).
+// Returns false if it hung past the timeout — in that case the SDK subprocess
+// is likely wedged and the caller should force-clear its own state.
+async function interruptWithTimeout(q: Query): Promise<boolean> {
+  const HUNG = Symbol("hung");
+  const result = await Promise.race([
+    q.interrupt().then(() => true, () => true),
+    new Promise<typeof HUNG>((r) => setTimeout(() => r(HUNG), INTERRUPT_TIMEOUT_MS)),
+  ]);
+  return result !== HUNG;
+}
 
 // Short aliases → full model IDs. Raw `claude-*` IDs are also accepted.
 const MODEL_ALIASES: Record<string, string> = {
@@ -233,7 +258,9 @@ const HELP_TEXT = [
   "/model <name>  — set the model (opus, sonnet, haiku, 4.6, …); no arg to show current",
   "/stop       — interrupt the current turn (queued messages keep going)",
   "/drain      — cancel everything still in the queue",
+  "/restart    — hard-restart the bot process (use if the bot is wedged)",
   "/cost       — show today's spend in this chat",
+  "/usage      — show last Anthropic-limit event (if any) and current model",
   "/help       — show this message",
   "",
   "Otherwise, just send a message and I'll work on it.",
@@ -244,13 +271,17 @@ interface PendingTurn {
   userMessageId: number;
   text: string;
   placeholderId: number;
+  enqueuedAt: number;
 }
 
 export class TelegramBridge {
   private bot: Bot;
   private active = new Map<string, Query>();
+  private activeStartedAt = new Map<string, number>();
   private queue = new Map<string, PendingTurn[]>();
   private readyTimer = new Map<string, NodeJS.Timeout>();
+  private watchdog: NodeJS.Timeout | null = null;
+  private lastLimitEvent: { message: string; at: number } | null = null;
 
   constructor(private readonly sessions: SessionStore) {
     this.bot = new Bot(config.telegramBotToken);
@@ -259,6 +290,7 @@ export class TelegramBridge {
 
   async start(): Promise<void> {
     console.log("Starting Telegram bot (long-polling)…");
+    this.watchdog = setInterval(() => this.checkStaleState(), WATCHDOG_INTERVAL_MS);
     // start() blocks; don't await — it runs until the bot stops
     void this.bot.start({
       allowed_updates: ["message", "edited_message"],
@@ -267,14 +299,46 @@ export class TelegramBridge {
   }
 
   async stop(): Promise<void> {
+    if (this.watchdog) {
+      clearInterval(this.watchdog);
+      this.watchdog = null;
+    }
     for (const t of this.readyTimer.values()) clearTimeout(t);
     this.readyTimer.clear();
     this.queue.clear();
-    for (const q of this.active.values()) {
-      try { await q.interrupt(); } catch { /* ignore */ }
-    }
+    await Promise.all(
+      [...this.active.values()].map((q) => interruptWithTimeout(q)),
+    );
     this.active.clear();
+    this.activeStartedAt.clear();
     await this.bot.stop();
+  }
+
+  // Last-ditch safety net. If anything has been stuck for an hour —
+  // an active turn, or a queue item that never moved — exit so systemd
+  // restarts us with clean in-memory state.
+  private checkStaleState(): void {
+    const now = Date.now();
+    for (const [chatId, startedAt] of this.activeStartedAt) {
+      const ageMs = now - startedAt;
+      if (ageMs > STALE_STATE_LIMIT_MS) {
+        console.error(
+          `WATCHDOG: active turn for chat ${chatId} is ${Math.floor(ageMs / 60000)}min old — exiting for systemd restart`,
+        );
+        process.exit(1);
+      }
+    }
+    for (const [chatId, items] of this.queue) {
+      const head = items[0];
+      if (!head) continue;
+      const ageMs = now - head.enqueuedAt;
+      if (ageMs > STALE_STATE_LIMIT_MS) {
+        console.error(
+          `WATCHDOG: queue head for chat ${chatId} is ${Math.floor(ageMs / 60000)}min old — exiting for systemd restart`,
+        );
+        process.exit(1);
+      }
+    }
   }
 
   private wire(): void {
@@ -301,9 +365,18 @@ export class TelegramBridge {
       const chatId = String(ctx.chat.id);
       const q = this.active.get(chatId);
       if (q) {
-        // The next queued message (if any) will auto-start via advanceQueue.
-        await q.interrupt();
-        await ctx.reply("⏹ stopped");
+        const clean = await interruptWithTimeout(q);
+        if (clean) {
+          // The runTurn finally block will clear active and advance the queue.
+          await ctx.reply("⏹ stopped");
+        } else {
+          // SDK is wedged — interrupt didn't complete. Force-clear so the
+          // chat isn't stuck on active.has() forever. The zombie SDK
+          // subprocess will leak until the service restarts.
+          this.active.delete(chatId);
+          this.advanceQueue(chatId);
+          await ctx.reply("⏹ force-stopped — SDK unresponsive, state cleared");
+        }
         return;
       }
       // Nothing running — cancel the front of the queue if it's about to fire.
@@ -316,6 +389,13 @@ export class TelegramBridge {
         return;
       }
       await ctx.reply("nothing running");
+    });
+
+    this.bot.command("restart", async (ctx) => {
+      await ctx.reply("♻ restarting — back in a few seconds");
+      // Exit non-zero so systemd's Restart=on-failure kicks in. Give the
+      // reply a moment to flush to Telegram before we die.
+      setTimeout(() => process.exit(1), 500);
     });
 
     this.bot.command("drain", async (ctx) => {
@@ -339,6 +419,23 @@ export class TelegramBridge {
       const chatId = String(ctx.chat.id);
       const spent = this.sessions.getDailyCost(chatId);
       await ctx.reply(`today: $${spent.toFixed(4)} / $${config.dailyCostCapUsd.toFixed(2)}`);
+    });
+
+    this.bot.command("usage", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      const model = this.sessions.getModel(chatId) ?? config.defaultModel;
+      const spent = this.sessions.getDailyCost(chatId);
+      const lines = [
+        `model: ${model}`,
+        `today's cost: $${spent.toFixed(4)} / $${config.dailyCostCapUsd.toFixed(2)}`,
+      ];
+      if (this.lastLimitEvent) {
+        const minsAgo = Math.floor((Date.now() - this.lastLimitEvent.at) / 60000);
+        lines.push(`last Anthropic limit hit ${minsAgo}m ago: ${this.lastLimitEvent.message}`);
+      } else {
+        lines.push("no Anthropic limit events since bot started");
+      }
+      await ctx.reply(lines.join("\n"));
     });
 
     this.bot.command("model", async (ctx) => {
@@ -425,6 +522,7 @@ export class TelegramBridge {
       userMessageId,
       text,
       placeholderId: placeholder.message_id,
+      enqueuedAt: Date.now(),
     });
     this.queue.set(chatId, items);
 
@@ -553,9 +651,29 @@ export class TelegramBridge {
       mcpServers: loadMcpServers(config.mcpConfigPath),
     });
     this.active.set(chatId, q);
+    this.activeStartedAt.set(chatId, Date.now());
 
     try {
-      for await (const m of q) {
+      // Drive iteration manually so we can race each step against an idle
+      // timeout. If the SDK stops emitting messages for more than
+      // TURN_IDLE_TIMEOUT_MS the turn is wedged (e.g. Bash blocked on a
+      // never-exiting dev server) and we abort.
+      const iter = q[Symbol.asyncIterator]();
+      while (true) {
+        const step = await Promise.race([
+          iter.next(),
+          new Promise<typeof IDLE_TIMEOUT_MARKER>((r) =>
+            setTimeout(() => r(IDLE_TIMEOUT_MARKER), TURN_IDLE_TIMEOUT_MS),
+          ),
+        ]);
+        if (step === IDLE_TIMEOUT_MARKER) {
+          throw new Error(
+            `Turn stalled — no SDK activity for ${TURN_IDLE_TIMEOUT_MS / 60000} min`,
+          );
+        }
+        if (step.done) break;
+        const m = step.value;
+
         if (m.type === "system" && m.subtype === "init") {
           this.sessions.saveSessionId(chatId, m.session_id);
           continue;
@@ -601,11 +719,27 @@ export class TelegramBridge {
       }
     } catch (err) {
       console.error("Turn failed:", err);
+      const msg = String(err);
+      // [ede_diagnostic] means the conversation state is broken (usually an
+      // orphan tool_use with no matching tool_result). Resume will keep
+      // failing identically — only a fresh session recovers.
+      if (msg.includes("[ede_diagnostic]") || msg.includes("Turn stalled")) {
+        this.sessions.clearSession(chatId);
+      }
+      const limitMatch = msg.match(/You've hit your limit[^"]*?(?=\\n|\n|$)/);
+      if (limitMatch) {
+        this.lastLimitEvent = { message: limitMatch[0].trim(), at: Date.now() };
+      }
+      // If the iterator is wedged, nudge the SDK subprocess so it has a
+      // chance to exit cleanly. We don't await unbounded — interruptWithTimeout
+      // caps it at 2s.
+      await interruptWithTimeout(q);
       try {
-        await this.bot.api.sendMessage(chatIdNum, `✗ turn failed: ${truncate(String(err), 500)}`);
+        await this.bot.api.sendMessage(chatIdNum, `✗ turn failed: ${truncate(msg, 500)}`);
       } catch { /* ignore */ }
     } finally {
       this.active.delete(chatId);
+      this.activeStartedAt.delete(chatId);
       this.advanceQueue(chatId);
     }
   }
