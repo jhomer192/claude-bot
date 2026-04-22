@@ -2,6 +2,9 @@
 Description=Claude Telegram bot
 After=network-online.target
 Wants=network-online.target
+# Disable systemd's default crash-rate limit: we self-restart via /restart
+# and the hour-watchdog, and we'd rather keep trying than ever stay down.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

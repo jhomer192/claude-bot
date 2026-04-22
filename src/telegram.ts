@@ -11,6 +11,10 @@ const EDIT_WINDOW_MS = 3000;
 // If the SDK emits nothing for this long, the turn is wedged (e.g. a Bash
 // call blocked on a never-exiting process). Abort and unblock the chat.
 const TURN_IDLE_TIMEOUT_MS = 8 * 60 * 1000;
+// Absolute wall-clock cap per turn. Catches actively-looping turns that
+// never go idle but spin forever (e.g. re-editing the same file chasing
+// a phantom bug). Bounds cost/usage blast radius.
+const TURN_MAX_DURATION_MS = 60 * 60 * 1000;
 // q.interrupt() can hang forever when the SDK subprocess is wedged.
 // Cap it so /stop always returns to the user.
 const INTERRUPT_TIMEOUT_MS = 2000;
@@ -650,8 +654,9 @@ export class TelegramBridge {
       model,
       mcpServers: loadMcpServers(config.mcpConfigPath),
     });
+    const turnStartedAt = Date.now();
     this.active.set(chatId, q);
-    this.activeStartedAt.set(chatId, Date.now());
+    this.activeStartedAt.set(chatId, turnStartedAt);
 
     try {
       // Drive iteration manually so we can race each step against an idle
@@ -660,6 +665,11 @@ export class TelegramBridge {
       // never-exiting dev server) and we abort.
       const iter = q[Symbol.asyncIterator]();
       while (true) {
+        if (Date.now() - turnStartedAt > TURN_MAX_DURATION_MS) {
+          throw new Error(
+            `Turn exceeded max duration of ${TURN_MAX_DURATION_MS / 60000} min`,
+          );
+        }
         const step = await Promise.race([
           iter.next(),
           new Promise<typeof IDLE_TIMEOUT_MARKER>((r) =>
@@ -723,7 +733,11 @@ export class TelegramBridge {
       // [ede_diagnostic] means the conversation state is broken (usually an
       // orphan tool_use with no matching tool_result). Resume will keep
       // failing identically — only a fresh session recovers.
-      if (msg.includes("[ede_diagnostic]") || msg.includes("Turn stalled")) {
+      if (
+        msg.includes("[ede_diagnostic]") ||
+        msg.includes("Turn stalled") ||
+        msg.includes("exceeded max duration")
+      ) {
         this.sessions.clearSession(chatId);
       }
       const limitMatch = msg.match(/You've hit your limit[^"]*?(?=\\n|\n|$)/);
