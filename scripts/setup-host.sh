@@ -54,7 +54,9 @@ echo "== Configuring git for claude user =="
 sudo -u claude git config --global user.name "Claude (Jack's bot)"
 sudo -u claude git config --global user.email "jhomer191@gmail.com"
 sudo -u claude git config --global init.defaultBranch main
-sudo -u claude git config --global --replace-all credential.helper ""
+# Use the credential store so git push/pull works without embedding the token
+# in remote URLs. Bootstrap the credentials file in the next steps below.
+sudo -u claude git config --global credential.helper store
 
 echo "== Creating /etc/claude-bot.env if missing =="
 if [ ! -f /etc/claude-bot.env ]; then
@@ -71,7 +73,11 @@ echo "Next steps:"
 echo "  1. Clone the bot repo to /opt/claude-bot (owned by a deploy user, not 'claude')"
 echo "  2. cd /opt/claude-bot && npm ci && npm run build"
 echo "  3. sudo chown -R claude:claude /opt/claude-bot"
-echo "  4. Fill in /etc/claude-bot.env"
-echo "  5. sudo cp systemd/claude-bot.service /etc/systemd/system/"
-echo "  6. sudo systemctl daemon-reload && sudo systemctl enable --now claude-bot"
-echo "  7. sudo journalctl -u claude-bot -f    # watch logs"
+echo "  4. Fill in /etc/claude-bot.env (set GITHUB_TOKEN etc.)"
+echo "  5. Bootstrap git credentials for the claude user (run after filling in GITHUB_TOKEN):"
+echo "       TOKEN=\$(sudo grep ^GITHUB_TOKEN /etc/claude-bot.env | cut -d= -f2)"
+echo "       echo \"https://x-access-token:\${TOKEN}@github.com\" | sudo -u claude tee /home/claude/.git-credentials > /dev/null"
+echo "       sudo chmod 600 /home/claude/.git-credentials"
+echo "  6. sudo cp systemd/claude-bot.service /etc/systemd/system/"
+echo "  7. sudo systemctl daemon-reload && sudo systemctl enable --now claude-bot"
+echo "  8. sudo journalctl -u claude-bot -f    # watch logs"

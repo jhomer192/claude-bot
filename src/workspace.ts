@@ -27,5 +27,8 @@ export async function ensureCloned(
   mkdirSync(workspaceDir, { recursive: true });
   const url = `https://x-access-token:${githubToken}@github.com/${slug}.git`;
   await exec("git", ["clone", "--depth", "50", url, dest], { maxBuffer: 32 * 1024 * 1024 });
+  // Strip the token from .git/config so the agent can't read it via cat/.git/config.
+  const cleanUrl = `https://github.com/${slug}.git`;
+  await exec("git", ["remote", "set-url", "origin", cleanUrl], { cwd: dest });
   return dest;
 }
