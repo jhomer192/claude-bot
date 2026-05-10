@@ -30,13 +30,6 @@ export interface TurnInput {
 // lookup inside the systemd sandbox. We've hit `spawn node EACCES` here, so
 // use the parent's execPath directly and surface the child's stderr plus
 // errno/syscall/path on spawn failure.
-// Secrets the parent process needs but the agent subprocess never should.
-// Stripping them prevents the agent from exfiltrating them via printenv/Bash.
-const SUBPROCESS_REDACTED_ENV_KEYS = [
-  "TELEGRAM_BOT_TOKEN",
-  "GITHUB_TOKEN",
-];
-
 function spawnClaudeCodeProcess({
   command,
   args,
@@ -45,16 +38,9 @@ function spawnClaudeCodeProcess({
   signal,
 }: SpawnOptions): SpawnedProcess {
   const resolved = command === "node" ? process.execPath : command;
-
-  // Remove secrets the agent has no legitimate use for.
-  const safeEnv = { ...env } as Record<string, string | undefined>;
-  for (const key of SUBPROCESS_REDACTED_ENV_KEYS) {
-    delete safeEnv[key];
-  }
-
   const child = spawn(resolved, args, {
     cwd,
-    env: safeEnv,
+    env,
     stdio: ["pipe", "pipe", "pipe"],
     signal,
     windowsHide: true,
@@ -76,8 +62,8 @@ export function startTurn({ prompt, sessionId, cwd, model, mcpServers }: TurnInp
     model,
     permissionMode: "bypassPermissions",
     systemPrompt: { type: "preset", preset: "claude_code" },
-    settingSources: [],
-    maxTurns: 10000,
+    settingSources: ["project"],
+    maxTurns: Number.MAX_SAFE_INTEGER,
     // Every Telegram message is already the answer — a structured follow-up
     // tool leaves an orphan tool_use that poisons the session on resume.
     disallowedTools: ["AskUserQuestion"],

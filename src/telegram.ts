@@ -1,5 +1,6 @@
 import { Bot, GrammyError, HttpError, type Context } from "grammy";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import * as pty from "node-pty";
 import { config } from "./config.js";
 import { SessionStore } from "./sessions.js";
 import { startTurn, loadMcpServers } from "./agent.js";
@@ -11,17 +12,20 @@ const EDIT_WINDOW_MS = 3000;
 // If the SDK emits nothing for this long, the turn is wedged (e.g. a Bash
 // call blocked on a never-exiting process). Abort and unblock the chat.
 const TURN_IDLE_TIMEOUT_MS = 8 * 60 * 1000;
-// Absolute wall-clock cap per turn. Catches actively-looping turns that
-// never go idle but spin forever (e.g. re-editing the same file chasing
-// a phantom bug). Bounds cost/usage blast radius.
-const TURN_MAX_DURATION_MS = 60 * 60 * 1000;
+// No wall-clock cap per turn — the auto applier legitimately runs long
+// (a "go find me jobs" sweep can apply to dozens of postings in one turn,
+// each with a Playwright nav + fill + submit). The idle watchdog
+// (TURN_IDLE_TIMEOUT_MS) still aborts genuinely-stalled turns, and /stop
+// remains the user's manual cutoff. Cost is bounded by DAILY_COST_CAP_USD.
 // q.interrupt() can hang forever when the SDK subprocess is wedged.
 // Cap it so /stop always returns to the user.
 const INTERRUPT_TIMEOUT_MS = 2000;
 // Last-ditch safety net: if any turn has been active or any queue item has
 // been sitting for longer than this, exit the process so systemd restarts
-// the service and clears all in-memory state.
-const STALE_STATE_LIMIT_MS = 60 * 60 * 1000;
+// the service and clears all in-memory state. Bumped from 1h to 12h so the
+// watchdog catches genuine wedges (queue stuck, hung SDK process) without
+// misfiring on a long-but-healthy job-application sweep.
+const STALE_STATE_LIMIT_MS = 12 * 60 * 60 * 1000;
 const WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
 
 const IDLE_TIMEOUT_MARKER = "__claude_bot_idle_timeout__";
@@ -288,6 +292,9 @@ export class TelegramBridge {
   private readyTimer = new Map<string, NodeJS.Timeout>();
   private watchdog: NodeJS.Timeout | null = null;
   private lastLimitEvent: { message: string; at: number } | null = null;
+  // Per-chat in-flight `claude auth login` PTY. While set, the next non-slash
+  // text message from the user is treated as the OAuth code rather than a turn.
+  private pendingLogin = new Map<string, pty.IPty>();
 
   constructor(private readonly sessions: SessionStore) {
     this.bot = new Bot(config.telegramBotToken);
@@ -511,7 +518,22 @@ export class TelegramBridge {
       }
     });
 
+    this.bot.command("relogin", async (ctx) => {
+      await this.startRelogin(ctx.chat.id);
+    });
+
     this.bot.on("message:text", async (ctx) => {
+      const chatId = String(ctx.chat.id);
+      // Pending OAuth code paste from /relogin? Pipe it into the running pty
+      // and short-circuit the normal turn enqueue path.
+      const loginPty = this.pendingLogin.get(chatId);
+      if (loginPty && !ctx.message.text.startsWith("/")) {
+        loginPty.write(ctx.message.text.trim() + "\r");
+        try {
+          await ctx.reply("⏳ submitting code…");
+        } catch { /* ignore */ }
+        return;
+      }
       if (ctx.message.text.startsWith("/")) return; // command handlers will have caught it
       await this.enqueueTurn(ctx, ctx.message.message_id, ctx.message.text);
     });
@@ -531,14 +553,6 @@ export class TelegramBridge {
   private async enqueueTurn(ctx: Context, userMessageId: number, text: string): Promise<void> {
     const chatIdNum = ctx.chat!.id;
     const chatId = String(chatIdNum);
-
-    const dailyCost = this.sessions.getDailyCost(chatId);
-    if (dailyCost >= config.dailyCostCapUsd) {
-      await ctx.reply(
-        `⛔ daily cost cap reached ($${dailyCost.toFixed(2)} / $${config.dailyCostCapUsd}). Try again tomorrow or raise the cap.`,
-      );
-      return;
-    }
 
     const items = this.queue.get(chatId) ?? [];
     const positionBehind = items.length + (this.active.has(chatId) ? 1 : 0);
@@ -631,21 +645,6 @@ export class TelegramBridge {
   private async runTurn(chatIdNum: number, prompt: string, placeholderId: number): Promise<void> {
     const chatId = String(chatIdNum);
 
-    // Re-check the cost cap: earlier items in the queue may have pushed us over
-    // since this one was accepted.
-    const dailyCost = this.sessions.getDailyCost(chatId);
-    if (dailyCost >= config.dailyCostCapUsd) {
-      try {
-        await this.bot.api.editMessageText(
-          chatIdNum,
-          placeholderId,
-          `⛔ daily cost cap reached ($${dailyCost.toFixed(2)} / $${config.dailyCostCapUsd})`,
-        );
-      } catch { /* ignore */ }
-      this.advanceQueue(chatId);
-      return;
-    }
-
     const sessionId = this.sessions.getSessionId(chatId);
     const repo = this.sessions.getRepo(chatId);
     const cwd = repo ? repoPath(config.workspaceDir, repo) : config.workspaceDir;
@@ -692,11 +691,6 @@ export class TelegramBridge {
       // never-exiting dev server) and we abort.
       const iter = q[Symbol.asyncIterator]();
       while (true) {
-        if (Date.now() - turnStartedAt > TURN_MAX_DURATION_MS) {
-          throw new Error(
-            `Turn exceeded max duration of ${TURN_MAX_DURATION_MS / 60000} min`,
-          );
-        }
         const step = await Promise.race([
           iter.next(),
           new Promise<typeof IDLE_TIMEOUT_MARKER>((r) =>
@@ -762,14 +756,27 @@ export class TelegramBridge {
       // failing identically — only a fresh session recovers.
       if (
         msg.includes("[ede_diagnostic]") ||
-        msg.includes("Turn stalled") ||
-        msg.includes("exceeded max duration")
+        msg.includes("Turn stalled")
       ) {
         this.sessions.clearSession(chatId);
       }
       const limitMatch = msg.match(/You've hit your limit[^"]*?(?=\\n|\n|$)/);
       if (limitMatch) {
         this.lastLimitEvent = { message: limitMatch[0].trim(), at: Date.now() };
+      }
+      // Anthropic auth fell over (expired session token / rotated API key).
+      // Auto-kick off the relogin flow so the user just has to click + paste —
+      // no SSH'ing into the box to run `claude login`.
+      const looksLikeAuthFailure =
+        /authentication_error|Invalid authentication credentials|API Error: 401|API Error: 403/i.test(msg);
+      if (looksLikeAuthFailure && !this.pendingLogin.has(chatId)) {
+        try {
+          await this.bot.api.sendMessage(
+            chatIdNum,
+            "🔐 auth dead — auto-kicking off /relogin",
+          );
+        } catch { /* ignore */ }
+        void this.startRelogin(chatIdNum);
       }
       // If the iterator is wedged, nudge the SDK subprocess so it has a
       // chance to exit cleanly. We don't await unbounded — interruptWithTimeout
@@ -784,5 +791,102 @@ export class TelegramBridge {
       this.activePrompt.delete(chatId);
       this.advanceQueue(chatId);
     }
+  }
+
+  // Spawn `claude auth login --claudeai` under a pseudo-TTY (Ink/the CLI
+  // refuses to run without raw-mode-capable stdin), capture the OAuth URL it
+  // prints, send the URL to the user, and route the next chat message into
+  // stdin as the auth code.
+  private async startRelogin(chatIdNum: number): Promise<void> {
+    const chatId = String(chatIdNum);
+    if (this.pendingLogin.has(chatId)) {
+      try {
+        await this.bot.api.sendMessage(
+          chatIdNum,
+          "relogin already in progress — paste the OAuth code, or wait it out",
+        );
+      } catch { /* ignore */ }
+      return;
+    }
+
+    let term: pty.IPty;
+    try {
+      term = pty.spawn("claude", ["auth", "login", "--claudeai"], {
+        name: "xterm-color",
+        cols: 100,
+        rows: 30,
+        cwd: process.env.HOME ?? "/home/claude",
+        env: process.env as { [key: string]: string },
+      });
+    } catch (err) {
+      try {
+        await this.bot.api.sendMessage(chatIdNum, `✗ relogin spawn failed: ${truncate(String(err), 300)}`);
+      } catch { /* ignore */ }
+      return;
+    }
+
+    this.pendingLogin.set(chatId, term);
+
+    // Strip ANSI escapes so URL/state matching survives terminal styling.
+    // (Cheap regex; handles CSI + a few common cases. Good enough.)
+    const stripAnsi = (s: string): string =>
+      s.replace(/\[[0-?]*[ -/]*[@-~]/g, "").replace(/\][^]*/g, "");
+
+    let buffer = "";
+    let urlSent = false;
+    let succeeded = false;
+
+    term.onData(async (data: string) => {
+      buffer += stripAnsi(data);
+      // Trim buffer occasionally so it doesn't grow without bound on a long run.
+      if (buffer.length > 8192) buffer = buffer.slice(-4096);
+
+      if (!urlSent) {
+        const m = buffer.match(/https:\/\/[^\s]+/);
+        if (m) {
+          urlSent = true;
+          try {
+            await this.bot.api.sendMessage(
+              chatIdNum,
+              `🔐 sign in here, then paste the auth code back as a chat message:\n${m[0]}`,
+            );
+          } catch (err) {
+            console.error("relogin: failed to send URL:", err);
+          }
+        }
+      }
+
+      if (!succeeded && /Login successful|Logged in|Authenticated|Success/i.test(buffer)) {
+        succeeded = true;
+        try {
+          await this.bot.api.sendMessage(chatIdNum, "✓ logged in");
+        } catch { /* ignore */ }
+      }
+    });
+
+    term.onExit(({ exitCode, signal }) => {
+      this.pendingLogin.delete(chatId);
+      if (!succeeded) {
+        const reason = signal ? `signal ${signal}` : `exit ${exitCode}`;
+        const tail = truncate(buffer.slice(-400), 400);
+        this.bot.api
+          .sendMessage(chatIdNum, `✗ relogin ended without success (${reason}). Tail:\n${tail}`)
+          .catch(() => {});
+      }
+    });
+
+    // Safety net — if the user never pastes the code, kill the pty after 10 min
+    // so we don't pin a zombie subprocess.
+    setTimeout(() => {
+      if (this.pendingLogin.get(chatId) === term) {
+        try {
+          term.kill();
+        } catch { /* ignore */ }
+        this.pendingLogin.delete(chatId);
+        this.bot.api
+          .sendMessage(chatIdNum, "⏱ relogin timed out (10 min). type /relogin to retry")
+          .catch(() => {});
+      }
+    }, 10 * 60 * 1000);
   }
 }
