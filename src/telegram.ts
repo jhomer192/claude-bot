@@ -12,11 +12,10 @@ const EDIT_WINDOW_MS = 3000;
 // If the SDK emits nothing for this long, the turn is wedged (e.g. a Bash
 // call blocked on a never-exiting process). Abort and unblock the chat.
 const TURN_IDLE_TIMEOUT_MS = 8 * 60 * 1000;
-// No wall-clock cap per turn — the auto applier legitimately runs long
-// (a "go find me jobs" sweep can apply to dozens of postings in one turn,
-// each with a Playwright nav + fill + submit). The idle watchdog
+// No wall-clock cap per turn — long sweeps are legitimate (a "go find me
+// jobs" run, a "rip through the test suite" run). The idle watchdog
 // (TURN_IDLE_TIMEOUT_MS) still aborts genuinely-stalled turns, and /stop
-// remains the user's manual cutoff. Cost is bounded by DAILY_COST_CAP_USD.
+// remains the user's manual cutoff.
 // q.interrupt() can hang forever when the SDK subprocess is wedged.
 // Cap it so /stop always returns to the user.
 const INTERRUPT_TIMEOUT_MS = 2000;
@@ -455,7 +454,7 @@ export class TelegramBridge {
     this.bot.command("cost", async (ctx) => {
       const chatId = String(ctx.chat.id);
       const spent = this.sessions.getDailyCost(chatId);
-      await ctx.reply(`today: $${spent.toFixed(4)} / $${config.dailyCostCapUsd.toFixed(2)}`);
+      await ctx.reply(`today: $${spent.toFixed(4)}`);
     });
 
     this.bot.command("usage", async (ctx) => {
@@ -464,7 +463,7 @@ export class TelegramBridge {
       const spent = this.sessions.getDailyCost(chatId);
       const lines = [
         `model: ${model}`,
-        `today's cost: $${spent.toFixed(4)} / $${config.dailyCostCapUsd.toFixed(2)}`,
+        `today's cost: $${spent.toFixed(4)}`,
       ];
       if (this.lastLimitEvent) {
         const minsAgo = Math.floor((Date.now() - this.lastLimitEvent.at) / 60000);
