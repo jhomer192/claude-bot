@@ -1,107 +1,121 @@
 # `-p` apocalypse runbook
 
-**Read this first if the bot stops responding in or after June 2026.**
+**Problem:** starting 2026-06, `claude -p` (non-interactive CLI) usage moves
+to a separate quota bank from Jack's interactive Claude Max. This bot runs
+the Agent SDK, which spawns `cli.js` over stdio — counts as `-p` for
+billing. After the cut, bot turns no longer count against Max; they count
+against a separate (size-unknown) bucket.
 
-## Background
+**Goal:** keep bot usage on Max. Don't pay per token. Don't depend on
+Anthropic being generous with the new bucket.
 
-Starting **2026-06**, Anthropic moves `claude -p` (non-interactive CLI) usage
-to a separate quota bank from interactive Claude Max. This bot runs the
-Agent SDK, which spawns `cli.js` over stdio — functionally `-p` for billing
-purposes. When the new bank lands, three things can happen:
+## The plan: drive `claude` interactively in tmux
 
-1. **New bank is generous.** Do nothing.
-2. **New bank is tight.** Bot starts failing with rate-limit errors. Flip
-   to Path A (below).
-3. **Both unworkable.** Build Path B (tmux send-keys).
+Interactive mode (no `-p`) bills against Max — that's the whole point of
+the workaround. We run one `claude` per chat inside a tmux session, send
+prompts via `tmux send-keys`, and detect turn completion via a Claude Code
+**Stop hook** that writes a signal file. The bot reads the JSONL
+transcript (perfect structured event stream, no TUI scraping) and renders
+to Telegram exactly like today.
 
-We do **not** migrate preemptively. We prep, we wait, we flip if needed.
+### Why tmux specifically (not raw node-pty)
 
-## Path A — switch to API billing (preferred, ~5 minutes)
+- **Session survives bot restart.** tmux sessions are independent processes.
+  When systemd restarts the bot, the in-flight `claude` keeps running.
+  node-pty dies with its parent — we'd lose unsent output.
+- **Manual debugging:** `tmux attach -t claude-<chatId>` lets Jack peek at
+  any session's TUI directly when something's weird.
+- **Mature multiplexer:** tmux handles PTY allocation, scrollback,
+  reconnection. We don't reinvent.
 
-`src/config.ts:33` already supports this: if `ANTHROPIC_API_KEY` is set,
-the SDK uses it automatically. No code changes needed.
+### Why hooks (not TUI scraping)
 
-**Steps:**
+The Stop hook gives us the transcript file path on every turn completion.
+The transcript is JSONL — same structured events the Agent SDK currently
+emits. We get tool_use blocks, text blocks, costs, usage — everything —
+without parsing Ink rendering. **Zero loss of fidelity vs SDK mode.**
 
-```bash
-# 1. On a workstation, mint a key at https://console.anthropic.com/
-#    Workspace → API Keys → Create Key. Save to ~/.secrets/side-projects.gpg.
+## Architecture
 
-# 2. On the VPS:
-ssh vps
-sudo /opt/claude-bot/scripts/flip-billing-mode.sh api sk-ant-api03-...
-# (script edits /etc/claude-bot.env and restarts the service)
-
-# 3. Verify:
-sudo journalctl -u claude-bot -n 20 --no-pager
-# look for clean startup, no auth errors
-
-# 4. Send a Telegram message to the bot. Confirm it responds.
-
-# 5. After ~1 hour of normal use, check the Anthropic console for the
-#    expected token spend. If billing didn't move, the SDK is still
-#    falling back to Max — check that ANTHROPIC_API_KEY is exported in
-#    /etc/claude-bot.env and that the service was restarted, not reloaded.
+```
+Telegram msg → bot
+              ↓
+              tmux send-keys -t claude-<chatId> -l "<prompt>"
+              tmux send-keys -t claude-<chatId> Enter
+              ↓
+              [claude processes, runs tools, writes text]
+              ↓
+              Stop hook fires
+                $ on-stop.sh
+                  → reads {session_id, transcript_path} from stdin
+                  → writes transcript_path to /var/lib/claude-bot/stop-signals/<session_id>
+              ↓
+              bot watches stop-signals/ via fs.watch
+              ↓
+              bot reads transcript JSONL from saved offset
+              parses new assistant message blocks
+              → renders to Telegram (same StreamingRenderer as today)
 ```
 
-**Cost expectations** (Opus 4 list pricing as of 2026-05):
-- Input: $15 / 1M tokens (~$0.015 per turn at typical input size)
-- Output: $75 / 1M tokens (~$0.075 per turn)
-- Heavy bot day (~50 turns): $2–5
-- Auto-applier-bot under the same key may dwarf this; budget separately
+## Status of the migration
 
-**To flip back to Max:**
+- [x] Stop-hook script and setup tooling shipped
+- [x] POC verifies the loop end-to-end on this box
+- [ ] `src/tmux-agent.ts` — drop-in replacement for `src/agent.ts`
+- [ ] `AGENT_MODE=tmux` env flag in `src/config.ts`
+- [ ] `runTurn` in `src/telegram.ts` routes to tmux-agent when flag is set
+- [ ] Migration script: existing SDK-managed sessions → tmux sessions
+- [ ] Production cutover (after we know what June's `-p` bank actually looks like)
 
-```bash
-sudo /opt/claude-bot/scripts/flip-billing-mode.sh max
-```
+## Operations
 
-This blanks `ANTHROPIC_API_KEY` and restarts. The SDK falls back to the
-Claude Code login at `~/.claude/.credentials.json` on the host.
-
-## Path B — tmux send-keys (last resort, ~3 days build)
-
-Run `claude` interactively in a tmux session per Telegram chat. Drive via
-`tmux send-keys`, scrape Ink TUI output back. Keeps usage on Max bank
-because interactive mode is classified as human use.
-
-**Not scaffolded.** Only build if Path A pricing is unworkable AND the new
-`-p` bank is tight. Sketch:
-
-1. Replace `agent.ts` with a tmux-session manager (one session per chat).
-2. Stream `tmux capture-pane` output diffs to parse responses.
-3. Strip ANSI / Ink markup to reconstruct text + tool-call events.
-4. Persist tmux session names to SQLite (parallels current `sessionId` map).
-
-Risks: Anthropic can detect headless TTY (no DISPLAY, predictable cadence,
-xterm-256color in a container) and reclassify. Migration becomes sunk cost
-overnight. Also loses the SDK's structured event stream — we'd reverse-
-engineer it from the TUI.
-
-## Smoke test (run quarterly while on Max)
-
-`scripts/smoke-api-key-mode.sh` provisions a throwaway config, runs one
-turn, and confirms the SDK accepts the API key. Run this before June and
-every ~90 days to ensure Path A still works:
+### Enable tmux mode (one-time, per host)
 
 ```bash
-./scripts/smoke-api-key-mode.sh sk-ant-api03-...
-# prints PASS or FAIL with a clear reason
+sudo ./scripts/setup-tmux-mode.sh
+# Installs ~/.claude/settings.json Stop hook for the `claude` service user.
+# Creates /var/lib/claude-bot/stop-signals/ with correct perms.
 ```
 
-## What we do NOT do
+### Run the POC to verify
 
-- ❌ Migrate to Path A preemptively. Max is currently cheaper.
-- ❌ Build Path B scaffolding. Wait until we know we need it.
-- ❌ Add a "billing mode" abstraction in code. One env var is already
-  enough; the SDK handles the rest.
-- ❌ Throttle the bot to "save" Max quota. Path A flip is the answer, not
-  artificial throttling.
+```bash
+./scripts/poc-tmux-claude.sh
+# Spawns a tmux'd claude in /tmp, sends a one-line prompt, waits for the
+# Stop hook to fire, prints the assistant's reply parsed from the
+# transcript. Exits 0 on success.
+```
 
-## Decision checkpoint when June lands
+### Inspect a live session
+
+```bash
+tmux attach -t claude-<chatId>
+# Read-only is safer: add `-r`.
+# Detach with C-b d (or C-b R d if your prefix is different).
+```
+
+### Kill a stuck session
+
+```bash
+tmux kill-session -t claude-<chatId>
+# bot will spawn a fresh one (with `claude --resume <uuid>`) on the next message
+```
+
+## Fallback: API billing (last resort, costs money)
+
+If tmux mode breaks for any reason — Anthropic adds TTY-automation
+detection, hook semantics change, whatever — we can fall back to pay-per-
+token API billing. Scripts kept for this emergency:
+
+- `scripts/flip-billing-mode.sh api sk-ant-...` — toggle `.env`
+- `scripts/smoke-api-key-mode.sh` — verify a key works before flipping
+
+We do **not** use API mode preemptively. Tmux is the plan.
+
+## Decision checkpoint: 2026-06
 
 | New `-p` bank looks like... | Action |
 |---|---|
-| ≥ current Max usage headroom | Stay on Max, do nothing |
-| Tight but not zero | Flip Path A, run on API billing |
-| Effectively unusable + API too expensive | Build Path B |
+| ≥ current usage headroom | Stay on SDK mode, do nothing |
+| Tight | Cut over to tmux mode (this runbook) |
+| Tmux mode also broken somehow | Flip to API billing (emergency only) |
