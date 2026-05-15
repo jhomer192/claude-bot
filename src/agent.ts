@@ -1,6 +1,5 @@
 import {
   query,
-  type Query,
   type Options,
   type SpawnOptions,
   type SpawnedProcess,
@@ -9,6 +8,12 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { config } from "./config.js";
+import {
+  startTmuxTurn,
+  defaultSettingsPath,
+  type TurnHandle,
+} from "./tmux-agent.js";
 
 const require_ = createRequire(import.meta.url);
 // SDK's package.json exports map doesn't expose cli.js, so resolve the main
@@ -24,7 +29,12 @@ export interface TurnInput {
   cwd: string;
   model: string;
   mcpServers?: Options["mcpServers"];
+  // Identifies the chat for tmux session naming. Required in tmux mode,
+  // ignored in sdk mode.
+  chatId?: string;
 }
+
+export type { TurnHandle } from "./tmux-agent.js";
 
 // The SDK defaults to spawning the literal string "node", relying on PATH
 // lookup inside the systemd sandbox. We've hit `spawn node EACCES` here, so
@@ -56,7 +66,22 @@ function spawnClaudeCodeProcess({
   return child as unknown as SpawnedProcess;
 }
 
-export function startTurn({ prompt, sessionId, cwd, model, mcpServers }: TurnInput): Query {
+export function startTurn({ prompt, sessionId, cwd, model, mcpServers, chatId }: TurnInput): TurnHandle {
+  if (config.agentMode === "tmux") {
+    if (!chatId) {
+      throw new Error("startTurn: chatId is required in tmux mode");
+    }
+    return startTmuxTurn({
+      prompt,
+      sessionId,
+      cwd,
+      model,
+      chatId,
+      signalDir: config.tmuxSignalDir,
+      settingsPath: defaultSettingsPath(config.tmuxSettingsPath),
+    });
+  }
+
   const options: Options = {
     cwd,
     model,
@@ -73,7 +98,10 @@ export function startTurn({ prompt, sessionId, cwd, model, mcpServers }: TurnInp
     ...(mcpServers ? { mcpServers } : {}),
   };
 
-  return query({ prompt, options });
+  // The SDK's Query satisfies our TurnHandle interface (async iterator +
+  // interrupt()). Cast through unknown because the Query message union is
+  // wider than SDKLikeMessage.
+  return query({ prompt, options }) as unknown as TurnHandle;
 }
 
 export function loadMcpServers(path: string | null): Options["mcpServers"] | undefined {

@@ -1,9 +1,8 @@
 import { Bot, GrammyError, HttpError, type Context } from "grammy";
-import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import * as pty from "node-pty";
 import { config } from "./config.js";
 import { SessionStore } from "./sessions.js";
-import { startTurn, loadMcpServers } from "./agent.js";
+import { startTurn, loadMcpServers, type TurnHandle } from "./agent.js";
 import { ensureCloned, isValidSlug, repoPath } from "./workspace.js";
 
 const MAX_MSG = 4096;
@@ -32,7 +31,7 @@ const IDLE_TIMEOUT_MARKER = "__claude_bot_idle_timeout__";
 // Returns true if interrupt() completed (success or SDK-side error).
 // Returns false if it hung past the timeout — in that case the SDK subprocess
 // is likely wedged and the caller should force-clear its own state.
-async function interruptWithTimeout(q: Query): Promise<boolean> {
+async function interruptWithTimeout(q: TurnHandle): Promise<boolean> {
   const HUNG = Symbol("hung");
   const result = await Promise.race([
     q.interrupt().then(() => true, () => true),
@@ -284,7 +283,7 @@ interface PendingTurn {
 
 export class TelegramBridge {
   private bot: Bot;
-  private active = new Map<string, Query>();
+  private active = new Map<string, TurnHandle>();
   private activeStartedAt = new Map<string, number>();
   private activePrompt = new Map<string, string>();
   private queue = new Map<string, PendingTurn[]>();
@@ -677,6 +676,7 @@ export class TelegramBridge {
       cwd,
       model,
       mcpServers: loadMcpServers(config.mcpConfigPath),
+      chatId,
     });
     const turnStartedAt = Date.now();
     this.active.set(chatId, q);
