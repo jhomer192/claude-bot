@@ -244,47 +244,53 @@ export function startTmuxTurn(input: TmuxTurnInput): TurnHandle {
     const transcriptPath = (await readFile(signalPath, "utf8")).trim();
     const raw = await readTranscriptWhenFlushed(transcriptPath, FLUSH_WAIT_MS);
 
-    // Parse JSONL: emit each assistant message; aggregate usage from the
-    // last one (the final assistant turn's usage is cumulative for the run).
-    let lastUsage: Record<string, number> = {};
-    let numTurns = 0;
-    // Only emit assistant lines that landed in THIS turn — easiest heuristic
-    // is to walk backwards from the end of the file until we hit a user
-    // message whose content matches our prompt.
-    const lines = raw.split("\n").filter((l) => l.trim());
-    let promptLineIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
+    // Slice this turn's events using the stop_hook_summary marker — every
+    // turn ends with exactly one system/stop_hook_summary event. Walk
+    // backward to find the LAST one (this turn's terminator), then back to
+    // the prior one (or start of file) and yield everything between.
+    // Prompt-text matching is fragile: if Jack sends the same prompt twice
+    // (e.g. "/help" repeatedly) we'd misidentify the boundary.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const parseLine = (s: string): any => {
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const ev: any = JSON.parse(lines[i]!);
-        if (ev.type === "user" && typeof ev.message?.content === "string" &&
-            ev.message.content === input.prompt) {
-          promptLineIdx = i;
-          break;
-        }
+        return JSON.parse(s);
       } catch {
-        // ignore malformed line
+        return null;
+      }
+    };
+    const lines = raw.split("\n").filter((l) => l.trim());
+    const stopIdxs: number[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const ev = parseLine(lines[i]!);
+      if (ev?.type === "system" && ev?.subtype === "stop_hook_summary") {
+        stopIdxs.push(i);
       }
     }
-    const slice = promptLineIdx >= 0 ? lines.slice(promptLineIdx + 1) : lines;
+    const turnEnd = stopIdxs.length > 0 ? stopIdxs[stopIdxs.length - 1]! : lines.length;
+    const turnStart = stopIdxs.length >= 2 ? stopIdxs[stopIdxs.length - 2]! + 1 : 0;
+    const slice = lines.slice(turnStart, turnEnd);
+
+    // Sum usage across all assistant events in this turn. Multi-tool-call
+    // turns produce multiple assistant blocks; per-event usage is the
+    // increment for that block, not a running total.
+    const usage: Record<string, number> = {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    };
+    let numTurns = 0;
 
     for (const line of slice) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let ev: any;
-      try {
-        ev = JSON.parse(line);
-      } catch {
-        continue;
-      }
+      const ev = parseLine(line);
+      if (!ev) continue;
       if (ev.type === "assistant" && ev.message?.content) {
         yield { type: "assistant", message: { content: ev.message.content } };
         if (ev.message.usage) {
-          lastUsage = {
-            input_tokens: ev.message.usage.input_tokens ?? 0,
-            output_tokens: ev.message.usage.output_tokens ?? 0,
-            cache_creation_input_tokens: ev.message.usage.cache_creation_input_tokens ?? 0,
-            cache_read_input_tokens: ev.message.usage.cache_read_input_tokens ?? 0,
-          };
+          usage.input_tokens! += ev.message.usage.input_tokens ?? 0;
+          usage.output_tokens! += ev.message.usage.output_tokens ?? 0;
+          usage.cache_creation_input_tokens! += ev.message.usage.cache_creation_input_tokens ?? 0;
+          usage.cache_read_input_tokens! += ev.message.usage.cache_read_input_tokens ?? 0;
         }
         numTurns += 1;
       }
@@ -295,7 +301,7 @@ export function startTmuxTurn(input: TmuxTurnInput): TurnHandle {
       subtype: "success",
       // Max billing — usage does not draw from the per-token wallet.
       total_cost_usd: 0,
-      usage: lastUsage,
+      usage,
       num_turns: numTurns,
       duration_ms: Date.now() - turnStartedAt,
     };
